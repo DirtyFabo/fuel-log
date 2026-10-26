@@ -341,8 +341,8 @@ const BASE=[
 
 /* ---------- Storage ---------- */
 const KEY='kalorien.v1';
-let state={goal:{kcal:2500,p:150,c:250,f:80,mode:'band',tol:10},days:{},marks:{}};
-try{const s=localStorage.getItem(KEY);if(s){const o=JSON.parse(s);state=Object.assign(state,o);state.goal=Object.assign({mode:'band',tol:10},o.goal||{});state.marks=o.marks||{};}}catch(e){}
+let state={goal:{kcal:2500,p:150,c:250,f:80,mode:'band',tol:10},days:{},marks:{},cache:{},recent:[]};
+try{const s=localStorage.getItem(KEY);if(s){const o=JSON.parse(s);state=Object.assign(state,o);state.goal=Object.assign({mode:'band',tol:10},o.goal||{});state.marks=o.marks||{};state.cache=o.cache||{};state.recent=o.recent||[];}}catch(e){}
 function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}}
 
 /* ---------- Date ---------- */
@@ -432,7 +432,8 @@ function renderToday(){
   [['mP','bP','p'],['mC','bC','c'],['mF','bF','f']].forEach(([a,b,m])=>{$(a).innerHTML=r0(t[m])+' <small>/ '+g[m]+' g</small>';$(b).style.width=Math.min(t[m]/g[m]*100,100)+'%';});
   const list=$('entries');
   if(!items.length)list.innerHTML='<div class="empty"><b>Noch nichts eingetragen</b>Schnelleingabe oben oder Barcode unter „Hinzufügen“.</div>';
-  else list.innerHTML=items.map((i,idx)=>{const f=i.g/100;return `<div class="entry" data-i="${idx}"><div class="n">${esc(i.name)}</div><div class="k">${fmt(i.k100*f)}<small>kcal</small></div><div class="d">${r0(i.g)} g${i.brand?' · '+esc(i.brand):''} · P ${r0((i.p100||0)*f)} · KH ${r0((i.c100||0)*f)} · F ${r0((i.f100||0)*f)}${i.t?' · '+i.t:''}</div></div>`;}).join('');
+  else list.innerHTML=items.map((i,idx)=>{const f=i.g/100;return `<div class="entry" data-i="${idx}"><div class="n">${esc(i.name)}</div><div class="k">${i.pending?'–':fmt(i.k100*f)}<small>kcal</small></div><div class="d">${r0(i.g)} g · ${i.pending?'<span style="color:var(--orange)">Nährwerte ausstehend</span>':(i.brand?esc(i.brand)+' · ':'')+'P '+r0((i.p100||0)*f)+' · KH '+r0((i.c100||0)*f)+' · F '+r0((i.f100||0)*f)}${i.t?' · '+i.t:''}</div></div>`;}).join('');
+  if(items.some(i=>i.pending))retryPending();
   renderWeek(); renderLevel();
 }
 $('entries').addEventListener('click',e=>{
@@ -474,9 +475,17 @@ $('searchForm').addEventListener('submit',e=>{e.preventDefault();const q=$('q').
 /* ---------- Produkt-Sheet ---------- */
 let prod=null;
 function parseServing(s){const m=/([\d.,]+)\s*(g|ml)/i.exec(s||'');return m?parseFloat(m[1].replace(',','.')):null;}
+function pickLang(v){ // search.openfoodfacts.org liefert Namen teils als {de:…, main:…}
+  if(v==null)return ''; if(typeof v==='string')return v;
+  if(typeof v==='object')return v.de||v.main||v.en||Object.values(v).find(x=>typeof x==='string')||'';
+  return String(v);
+}
 function fromOFF(p){
   const n=p.nutriments||{}; let k=n['energy-kcal_100g']; if(k==null&&n['energy_100g']!=null)k=n['energy_100g']/4.184;
-  return {code:p.code,name:p.product_name_de||p.product_name||'Unbenannt',brand:(p.brands||'').split(',')[0].trim(),k100:+k||0,p100:+n.proteins_100g||0,c100:+n.carbohydrates_100g||0,f100:+n.fat_100g||0,serving:parseServing(p.serving_size),img:p.image_small_url};
+  const name=pickLang(p.product_name_de)||pickLang(p.product_name)||'Unbenannt';
+  const brands=Array.isArray(p.brands)?p.brands.join(','):pickLang(p.brands);
+  const img=pickLang(p.image_small_url)||pickLang(p.image_front_small_url)||'';
+  return {code:p.code,name,brand:(brands||'').split(',')[0].trim(),k100:+k||0,p100:+n.proteins_100g||0,c100:+n.carbohydrates_100g||0,f100:+n.fat_100g||0,serving:parseServing(pickLang(p.serving_size)),img};
 }
 function openSheet(p){
   prod=p; $('pName').textContent=p.name; $('pBrand').textContent=p.local?'Grundnahrungsmittel':(p.brand||'');
@@ -495,16 +504,46 @@ function updSum(){if(!prod)return;const g=parseFloat($('grams').value)||0,f=g/10
 $('grams').addEventListener('input',updSum);
 $('chips').addEventListener('click',e=>{const b=e.target.closest('.chip');if(b){$('grams').value=b.dataset.g;updSum();}});
 $('sheetBg').onclick=closeSheet;
-$('addBtn').onclick=()=>{const g=parseFloat($('grams').value);if(!prod||!(g>0)){toast('Menge eingeben');return;}addItem({name:prod.name,brand:prod.local?'':prod.brand,g,k100:prod.k100,p100:prod.p100,c100:prod.c100,f100:prod.f100});closeSheet();};
+$('addBtn').onclick=()=>{const g=parseFloat($('grams').value);if(!prod||!(g>0)){toast('Menge eingeben');return;}
+  const item={name:prod.name,brand:prod.local?'':prod.brand,g,k100:prod.k100,p100:prod.p100,c100:prod.c100,f100:prod.f100};
+  if(prod.code)item.code=prod.code; if(prod.pending)item.pending=true;
+  remember(prod); addItem(item); closeSheet();};
+function remember(p){ // Produkt-Cache + Zuletzt-verwendet, beides offline nutzbar
+  if(p.pending)return;
+  const key=p.code||('n:'+p.name); const rec={code:p.code||'',name:p.name,brand:p.local?'':p.brand,k100:p.k100,p100:p.p100,c100:p.c100,f100:p.f100,serving:p.serving||null,local:!!p.local};
+  if(p.code)state.cache[p.code]=rec;
+  state.recent=[rec].concat(state.recent.filter(r=>(r.code||('n:'+r.name))!==key)).slice(0,30);
+}
 function addItem(i){
   if(current>today())current=today();
   const wasHit=isHit(current);
   i.t=new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit'});
   (state.days[current]=state.days[current]||[]).push(i); save();
   const nowHit=isHit(current);
-  toast(nowHit&&!wasHit?'Ziel erreicht · +'+(50+10*Math.min(streakEnding(current),10))+' Punkte':'+'+fmt(i.k100*i.g/100)+' kcal · +5 Punkte');
+  toast(i.pending?'Eingetragen – Nährwerte werden nachgeladen':nowHit&&!wasHit?'Ziel erreicht · +'+(50+10*Math.min(streakEnding(current),10))+' Punkte':'+'+fmt(i.k100*i.g/100)+' kcal · +5 Punkte');
   pending=null; show('today');
 }
+function renderRecent(){
+  const res=$('results'); if(res.innerHTML)return;
+  const items=state.recent; if(!items.length)return;
+  res._ps=items.slice(); res.innerHTML='<div class="label sect">Zuletzt verwendet</div>'+items.map((p,i)=>`<button class="res" data-i="${i}"><div class="ph">${p.local?'Basis':p.code?'EAN':'Man.'}</div><div><div class="n">${esc(p.name)}</div><div class="b">${p.local?'Grundnahrungsmittel':esc(p.brand||'')}</div></div><div class="k">${r0(p.k100)}<small>kcal/100 g</small></div></button>`).join('');
+}
+/* Nachladen fehlender Nährwerte, sobald die Datenbank wieder antwortet */
+let retrying=false;
+async function retryPending(){
+  if(retrying||!navigator.onLine)return; retrying=true;
+  try{
+    let changed=false;
+    for(const k of Object.keys(state.days)){for(const it of state.days[k]){
+      if(!it.pending||!it.code)continue;
+      let p; try{p=await fetchProduct(it.code);}catch(e){return;} // Datenbank noch nicht erreichbar – später erneut
+      if(!p||!p.k100)continue;
+      Object.assign(it,{name:p.name,brand:p.brand,k100:p.k100,p100:p.p100,c100:p.c100,f100:p.f100}); delete it.pending; remember(p); changed=true;
+    }}
+    if(changed){save();toast('Nährwerte nachgeladen');if($('v-today').classList.contains('active'))renderToday();}
+  }finally{retrying=false;}
+}
+window.addEventListener('online',retryPending);
 
 /* ---------- Suche ---------- */
 let searchAbort=null;
@@ -514,27 +553,57 @@ async function search(q){
   const card=(p,i)=>`<button class="res" data-i="${i}">${p.local?'<div class="ph">Basis</div>':p.img?`<img src="${esc(p.img)}" alt="" loading="lazy">`:'<div class="ph">OFF</div>'}<div><div class="n">${esc(p.name)}</div><div class="b">${p.local?(p.serving?'1 Stück ≈ '+p.serving+' g':'Grundnahrungsmittel'):esc(p.brand)}</div></div><div class="k">${r0(p.k100)}<small>kcal/100 g</small></div></button>`;
   res._ps=loc.slice(); res.innerHTML=loc.map(card).join('');
   st.hidden=false; st.textContent='Open Food Facts wird durchsucht …';
-  if(searchAbort)searchAbort.abort(); searchAbort=new AbortController();
-  try{
-    const u=OFF+'/cgi/search.pl?search_terms='+encodeURIComponent(q)+'&search_simple=1&action=process&json=1&page_size=20&fields='+FIELDS;
-    const r=await fetch(u,{signal:searchAbort.signal}); if(!r.ok)throw new Error(r.status);
-    const d=await r.json(); const ps=(d.products||[]).map(fromOFF).filter(p=>p.k100>0);
-    if(!ps.length&&!loc.length){st.textContent='Nichts gefunden. Anders schreiben oder manuell eintragen.';return;}
-    st.hidden=true; const off=ps.length?`<div class="label sect">Produkte (Open Food Facts)</div>`:'';
-    res.innerHTML=loc.map(card).join('')+off+ps.map((p,i)=>card(p,loc.length+i)).join(''); res._ps=loc.concat(ps);
-  }catch(e){if(e.name==='AbortError')return; st.textContent=loc.length?'Open Food Facts nicht erreichbar.':'Suche fehlgeschlagen. Internet prüfen.';}
+  if(searchAbort)searchAbort.abort(); searchAbort=new AbortController(); const sig=searchAbort.signal;
+  const enc=encodeURIComponent(q), errors=[];
+  // Drei Wege nacheinander: neuer Suchdienst, dann der alte Endpunkt auf zwei Hosts.
+  const routes=[
+    ['search.openfoodfacts.org','https://search.openfoodfacts.org/search?q='+enc+'&langs=de&page_size=20',d=>d.hits||d.products||[]],
+    ['world.openfoodfacts.org','https://world.openfoodfacts.org/cgi/search.pl?search_terms='+enc+'&search_simple=1&action=process&json=1&page_size=20&lc=de&fields='+FIELDS,d=>d.products||[]],
+    ['de.openfoodfacts.org','https://de.openfoodfacts.org/cgi/search.pl?search_terms='+enc+'&search_simple=1&action=process&json=1&page_size=20&fields='+FIELDS,d=>d.products||[]]
+  ];
+  let ps=null;
+  for(const [host,url,pick] of routes){
+    try{
+      const r=await fetch(url,{signal:sig,headers:{'Accept':'application/json'}});
+      if(!r.ok){errors.push(host+': HTTP '+r.status+(r.status===429||r.status===503?' (Limit: max. 10 Suchen/Minute)':''));continue;}
+      const d=await r.json(); ps=pick(d).map(fromOFF).filter(p=>p.k100>0); break;
+    }catch(e){ if(e.name==='AbortError')return; errors.push(host+': '+(e.message||'Netzwerkfehler')); }
+  }
+  if(ps===null){ st.textContent=(loc.length?'Open Food Facts nicht erreichbar':'Suche fehlgeschlagen')+' – '+errors.join(' · '); return; }
+  if(!ps.length&&!loc.length){st.textContent='Nichts gefunden. Anders schreiben oder manuell eintragen.';return;}
+  st.hidden=true; const off=ps.length?`<div class="label sect">Produkte (Open Food Facts)</div>`:'';
+  res.innerHTML=loc.map(card).join('')+off+ps.map((p,i)=>card(p,loc.length+i)).join(''); res._ps=loc.concat(ps);
 }
 $('results').addEventListener('click',e=>{const b=e.target.closest('.res');if(b)openSheet($('results')._ps[+b.dataset.i]);});
 
 /* ---------- Barcode ---------- */
+/* Liefert Produkt, null (nicht in DB) oder wirft bei Netz-/Serverfehler */
+async function fetchProduct(code){
+  let err='';
+  for(const host of ['https://de.openfoodfacts.org','https://world.openfoodfacts.org']){
+    try{
+      const r=await fetch(host+'/api/v2/product/'+encodeURIComponent(code)+'.json?lc=de&fields='+FIELDS,{headers:{'Accept':'application/json'}});
+      if(r.status===404)return null; if(!r.ok){err='HTTP '+r.status;continue;}
+      const d=await r.json(); if(d.status!==1||!d.product)return null; return fromOFF(d.product);
+    }catch(e){err=e.message||'Netzwerkfehler';}
+  }
+  throw new Error(err||'nicht erreichbar');
+}
 async function lookup(code){
-  const st=$('addStatus'); st.hidden=false; st.textContent='Barcode '+code+' …'; $('results').innerHTML='';
-  try{
-    const r=await fetch(OFF+'/api/v2/product/'+encodeURIComponent(code)+'.json?fields='+FIELDS); const d=await r.json();
-    if(d.status!==1||!d.product){st.textContent='Barcode '+code+' ist nicht in Open Food Facts. Per Name suchen oder manuell eintragen.';return;}
-    const p=fromOFF(d.product); if(!p.k100){st.textContent=p.name+': keine Nährwerte hinterlegt. Manuell eintragen.';return;}
-    st.hidden=true; openSheet(p);
-  }catch(e){st.textContent='Abfrage fehlgeschlagen. Internet prüfen.';}
+  const st=$('addStatus'); $('results').innerHTML='';
+  const cached=state.cache[code];
+  if(cached){st.hidden=true;openSheet(Object.assign({},cached,{code}));return;} // sofort, ohne Internet
+  st.hidden=false; st.textContent='Barcode '+code+' …';
+  let p;
+  try{p=await fetchProduct(code);}
+  catch(e){
+    st.innerHTML='Open Food Facts nicht erreichbar ('+esc(e.message)+'). <button class="btn ghost" id="pendBtn" type="button" style="margin-top:8px;display:block">Trotzdem eintragen – Nährwerte nachladen</button>';
+    $('pendBtn').onclick=()=>{st.hidden=true;openSheet({code,name:'Produkt '+code,brand:'ausstehend',k100:0,p100:0,c100:0,f100:0,pending:true});};
+    return;
+  }
+  if(!p){st.textContent='Barcode '+code+' ist nicht in Open Food Facts. Per Name suchen oder manuell eintragen.';return;}
+  if(!p.k100){st.textContent=p.name+': keine Nährwerte hinterlegt. Manuell eintragen.';return;}
+  st.hidden=true; openSheet(p);
 }
 let scanner=null,scanning=false,lastCode='',lastAt=0;
 async function startScan(){
@@ -578,10 +647,10 @@ function show(v){
   document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   $('main').scrollTop=0;
   if(v==='today')renderToday(); if(v==='hist')renderHist();
-  if(v!=='add')stopScan(); else if(!scanning&&!$('results').innerHTML)startScan();
+  if(v!=='add')stopScan(); else{renderRecent(); if(!scanning)startScan();}
 }
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>show(b.dataset.v));
-renderToday();
+renderToday(); retryPending();
 })();
 </script>
 </body>
